@@ -11,6 +11,19 @@ class Config:
     n_head: int = 6
     n_embd: int = 384
 
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__innit__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAtention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1)
+        x = x + self.mlp(self.ln_2)
+        return x
+
 class GPT(nn.Modules):
     def __init__(self, config):
         super().__init__()
