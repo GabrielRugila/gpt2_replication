@@ -11,6 +11,19 @@ class Config:
     n_head: int = 6
     n_embd: int = 384
 
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__innit__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd) # 
+        self.gelu = nn.GELU(approximate='tanh') # no real benefit nowadays compared to exact # more modern models are now using 'SwiGLU', 'RoPE' and ohers
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) #
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__innit__()
