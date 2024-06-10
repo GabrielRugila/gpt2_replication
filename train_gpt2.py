@@ -6,26 +6,25 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    block_size: int = 256
-    vocab_size: int = 65
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
-
+    block_size: int = 1024
+    vocab_size: int = 50257 # * tokens: 50k BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
-        super().__innit__()
+        super().__init__()
         assert config.n_embd % config.n_head == 0
 
         # * Key, Query, Value projections for the heads, in batch format
-        self.c_atnn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection 
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         # * docs from OpenAI and HF refer to this as 'bias', but it acts more like a mask
-        self.register_buffer("bias/mask", torch.trill(torch.ones(config.block_size, config.block_size))
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                              .view(1, 1, config.block_size, config.block_size))
         
     def forward(self, x):
@@ -34,8 +33,8 @@ class CausalSelfAttention(nn.Module):
         # * Calculate Q, K and V for all heads in batch and move the head forward to be the batch
         # C (n channels) = nh * hs
         # e.g. GPT-2 (124M): n_head=12, hs=64, C=768 (12*64) channels in the Transformer
-        qkv = self.c_atnn(x)
-        q, k, v = qkv.split(self.embd, dim=2)
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
         # (B, n heads, T, head size)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
@@ -55,10 +54,10 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     def __init__(self, config):
-        super().__innit__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd) # 
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd) 
         self.gelu = nn.GELU(approximate='tanh') # * no real benefit nowadays compared to exact; more modern models are now using 'SwiGLU', 'RoPE' and ohers
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) #
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) 
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -68,18 +67,18 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, config):
-        super().__innit__()
+        super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1)
-        x = x + self.mlp(self.ln_2)
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
-
-class GPT(nn.Modules):
+    
+class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -91,3 +90,49 @@ class GPT(nn.Modules):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    @classmethod
+    def from_pretrained(cls, model_type):
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+        print("Loading weights from pretrained gpt: %s" %model_type)
+
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        config_args['vocab_size'] = 50257 
+        config_args['block_size'] = 1024 
+
+        config = Config(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] 
+
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] 
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] 
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+
+model = GPT.from_pretrained('gpt2')
+print("It works!!!")
