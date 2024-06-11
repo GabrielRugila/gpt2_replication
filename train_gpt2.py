@@ -231,6 +231,7 @@ torch.set_float32_matmul_precision('high')
 model = GPT(Config())
 model.eval()
 model.to(device)
+model = torch.compile(model)
 
 import time
 
