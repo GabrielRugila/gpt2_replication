@@ -20,6 +20,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection 
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.GPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -58,6 +59,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd) 
         self.gelu = nn.GELU(approximate='tanh') # * no real benefit nowadays compared to exact; more modern models are now using 'SwiGLU', 'RoPE' and ohers
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) 
+        self.c_proj.GPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -91,18 +93,21 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # * weigth sharing scheme, saves around ~30%
+        # * weigth sharing scheme, saves around ~30%, but ends upbein initialized 2x
         self.transformer.wte.weight = self.lm_head.weight
         # init the weights of params
         self.apply(self.__init__weights)
 
     def __init__weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            if hasattr(module, "GPT_SCaLE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         # idx shape (B, T)
@@ -213,24 +218,36 @@ class DataLoaderLite:
         return x, y
 
 # --------------------------------------------------------------------------------------------------------------------------------
-
-train_loader = DataLoaderLite(4, 32)
-
 device = get_device()
+
+torch.manual_seed(1337)
+if torch.cuda.is_available(): 
+    torch.cuda.manual_seed(1337)
+
+train_loader = DataLoaderLite(8, 1024)
+
+torch.set_float32_matmul_precision('high')
 
 model = GPT(Config())
 model.eval()
 model.to(device)
 
+import time
+
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y =  train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"Step {i}, Loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    tks = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"Step {i}, Loss: {loss.item()}, Time: {dt:.2f}ms, tk/s: {tks:.2f}")
 
 
 import sys
