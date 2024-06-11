@@ -91,7 +91,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Unable to forward sequence of length {T}, block size is {self.config.block_size}"
@@ -104,9 +104,14 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
 
-        x = self.transformer.ln_f(x)
+        x = self.transformer.ln_f(x) # (B, T, Vocab_Size)
         logits = self.lm_head(x)
-        return logits
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -152,36 +157,46 @@ class GPT(nn.Module):
         return model
 
 
-num_return_sequences = 5
-max_length = 30
-
-model = GPT.from_pretrained('gpt2')
-model.eval()
-model.to('cuda')
+def get_device():
+    if torch.cuda.is_available():
+        print("Using CUDA")
+        return "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_initialized():
+        print("Using MPS")
+        return "mps"
+    else:
+        print("Using CPU")
+        return "cpu"
+    
+device = get_device()
 
 import tiktoken
+
 enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to('cuda')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buffer = torch.tensor(tokens[:B*T + 1]).to(device)
+x = buffer[:-1].view(B, T)
+y = buffer[1:].view(B, T)
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x)
-        logits = logits[:, -1, :]
+model = GPT(Config())
+model.eval()
+model.to(device)
 
-        probs = F.softmax(logits, dim=-1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"\nStep {i}, Loss: {loss.item()}")
 
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+# import numpy as np
 
-        ix = torch.multinomial(topk_probs, 1)
-        xcol = torch.gather(topk_indices, -1, ix)
-        x = torch.cat((x, xcol), dim=1)
+# print(f"Expected Loss: {-np.log(1 / Config.vocab_size)} \nGot: {loss}")
 
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+import sys
+sys.exit(0)
