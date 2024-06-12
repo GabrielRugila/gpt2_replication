@@ -27,9 +27,6 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        # * docs from OpenAI and HF refer to this as 'bias', but it acts more like a mask
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                             .view(1, 1, config.block_size, config.block_size))
         
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality
@@ -44,11 +41,6 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # # attention (creates the large (T,T) matrix for all query and keys)
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v # (B, nh, T, T) . (B, nh, T, hs) -> (B, nh, T, hs)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assembling the head outputs side-by-side
@@ -178,7 +170,7 @@ class GPT(nn.Module):
 
         return model
     
-    def configure_optimizers(self, weight_decay:float, learning_rate:float, device) -> torch.optim.AdamW:
+    def configure_optimizers(self, weight_decay:float, learning_rate:float, device_type:str) -> torch.optim.AdamW:
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
@@ -195,7 +187,7 @@ class GPT(nn.Module):
         print(f"num non-decayed parameer tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and 'cuda' in device
+        use_fused = fused_available and device_type == "cuda"
         print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
@@ -214,22 +206,35 @@ def get_device():
         return "cpu"
 
 import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
-    def __init__(self, B:int, T:int, process_rank:int, num_processes:int) -> None:
+    def __init__(self, B:int, T:int, process_rank:int, num_processes:int, split:str) -> None:
         self.B = B
         self.T = T
         self.rank = process_rank
         self.num_processes = num_processes
+        assert split in {'train', 'val'}
 
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"Loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = sorted([s for s in shards if split in s])
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"No shards found for split {split}"
+        if master_process:
+            print(f"Found {len(shards)} shards for split {split}")
 
+        self.reset()
+
+    def reset(self) -> None:
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_pos = self.B * self.T * self.rank
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -241,9 +246,12 @@ class DataLoaderLite:
         self.current_pos += B * T * self.num_processes
 
         if self.current_pos + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_pos = self.B * self.T * self.rank
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_pos = B * T * self.rank
 
         return x, y
+    
 
 # --------------------------------------------------------------------------------------------------------------------------------
 #* DDP Set-Up
@@ -268,6 +276,7 @@ else:
     master_process = True
     device = get_device()
 
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 # --------------------------------------------------------------------------------------------------------------------------------
 #* Set Seed
 torch.manual_seed(1337)
@@ -285,7 +294,8 @@ if master_process:
     print(f"Calculated gradient accumulation steps: {grad_accum_steps}")
 
 #* Create the batch sequences matrices
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 #* Set torch matrix multiplications to TF32 precision
 torch.set_float32_matmul_precision('high')
@@ -293,7 +303,9 @@ torch.set_float32_matmul_precision('high')
 #* Model Initialization
 model = GPT(Config(vocab_size=50304))
 model.to(device)
-model = torch.compile(model)
+use_compile = False
+if use_compile:
+    model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
@@ -301,8 +313,8 @@ raw_model = model.module if ddp else model
 #* Learning Rate
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 128
+max_steps = 19702
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -315,20 +327,41 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 #* Optimizer initialization
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
-#* Train Run
+#* Loop
 import time
 
 for step in range(max_steps):
     t0 = time.time()
+    #* Val Loop every 100 it
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"Val Loss: {val_loss_accum.item():.4f}")
+
+    #* Train Loop
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
     for mirco_step in range(grad_accum_steps):
         x, y =  train_loader.next_batch()
         x, y = x.to(device), y.to(device)
 
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
 
         #* Loss needs to be scaled to account for the gradient accumulation introduced here,
