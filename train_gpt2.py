@@ -1,5 +1,6 @@
 import inspect
 import math
+import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -14,7 +15,7 @@ class Config:
     n_embd: int = 768
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config:Config) -> None:
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
@@ -30,7 +31,7 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                              .view(1, 1, config.block_size, config.block_size))
         
-    def forward(self, x):
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality
 
         # * Calculate Q, K and V for all heads in batch and move the head forward to be the batch
@@ -57,34 +58,34 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config:Config) -> None:
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd) 
         self.gelu = nn.GELU(approximate='tanh') # * no real benefit nowadays compared to exact; more modern models are now using 'SwiGLU', 'RoPE' and ohers
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) 
         self.c_proj.GPT_SCALE_INIT = 1
 
-    def forward(self, x):
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
         return x
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config:Config) -> None:
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
     
 class GPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config:Config) -> None:
         super().__init__()
         self.config = config
 
@@ -101,7 +102,7 @@ class GPT(nn.Module):
         # init the weights of params
         self.apply(self.__init__weights)
 
-    def __init__weights(self, module):
+    def __init__weights(self, module) -> None:
         if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, "GPT_SCaLE_INIT"):
@@ -112,7 +113,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx:torch.Tensor, targets:torch.Tensor=None) -> tuple[torch.Tensor, torch.Tensor|None]:
         # idx shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Unable to forward sequence of length {T}, block size is {self.config.block_size}"
@@ -135,7 +136,7 @@ class GPT(nn.Module):
         return logits, loss
 
     @classmethod
-    def from_pretrained(cls, model_type):
+    def from_pretrained(cls, model_type:str):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
         print("Loading weights from pretrained model: %s" %model_type)
@@ -177,7 +178,7 @@ class GPT(nn.Module):
 
         return model
     
-    def configure_optimizers(self, weight_decay, learning_rate, device):
+    def configure_optimizers(self, weight_decay:float, learning_rate:float, device) -> torch.optim.AdamW:
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
@@ -215,9 +216,11 @@ def get_device():
 import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B:int, T:int, process_rank:int, num_processes:int) -> None:
         self.B = B
         self.T = T
+        self.rank = process_rank
+        self.num_processes = num_processes
 
         with open('input.txt', 'r') as f:
             text = f.read()
@@ -227,45 +230,75 @@ class DataLoaderLite:
         print(f"Loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
-        self.current_pos = 0
+        self.current_pos = self.B * self.T * self.rank
 
-    def next_batch(self):
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         B, T = self.B, self.T
         buffer = self.tokens[self.current_pos : self.current_pos + B * T + 1]
         x = (buffer[:-1]).view(B, T)
         y = (buffer[1:]).view(B, T)
 
-        self.current_pos += B*T
+        self.current_pos += B * T * self.num_processes
 
-        if self.current_pos + (B * T + 1) > len(self.tokens):
-            self.current_pos = 0
-        
+        if self.current_pos + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_pos = self.B * self.T * self.rank
+
         return x, y
 
 # --------------------------------------------------------------------------------------------------------------------------------
-device = get_device()
+#* DDP Set-Up
+import torch.distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "Not enough CUDA detected for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = get_device()
+
+# --------------------------------------------------------------------------------------------------------------------------------
+#* Set Seed
 torch.manual_seed(1337)
 if torch.cuda.is_available(): 
     torch.cuda.manual_seed(1337)
 
+#* Batch Initialization
 total_batch_size = 524288 # 2**19, ~0.5M (in number of tokens)
 B = 8
 T = 1024
-assert total_batch_size % (B * T) == 0, "Total batch size must be divisible by B * T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"Total desired batch size: {total_batch_size}")
-print(f"Calculated gradient accumulation steps: {grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0, "Total batch size must be divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"Total desired batch size: {total_batch_size}")
+    print(f"Calculated gradient accumulation steps: {grad_accum_steps}")
 
+#* Create the batch sequences matrices
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
-train_loader = DataLoaderLite(B=B, T=T)
-
+#* Set torch matrix multiplications to TF32 precision
 torch.set_float32_matmul_precision('high')
 
+#* Model Initialization
 model = GPT(Config(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
+#* Learning Rate
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
@@ -281,8 +314,10 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+#* Optimizer initialization
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
+#* Train Run
 import time
 
 for step in range(max_steps):
@@ -302,7 +337,12 @@ for step in range(max_steps):
         #* so we scale the loss by the accumulation amount.
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        if ddp:
+            #! This could stop working depending on pytorch updates
+            model.require_backward_grad_sync = (mirco_step == grad_accum_steps - 1)
         loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -316,9 +356,12 @@ for step in range(max_steps):
 
     t1 = time.time()
     dt = t1 - t0
-    tks = (train_loader.B * train_loader.T * grad_accum_steps) / dt
-    print(f"Step {step:4d}\t||\tLoss: {loss_accum.item():.6f}\t||\tLR: {lr:.2e}\t||\tNorm: {norm:.4f}\t||\tTime: {dt*1000:.2f}ms\t||\ttk/s: {tks:.2f}")
+    tks = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / dt
+    if master_process:
+        print(f"Step {step:4d}\t||\tLoss: {loss_accum.item():.6f}\t||\tLR: {lr:.2e}\t||\tNorm: {norm:.4f}\t||\tTime: {dt*1000:.2f}ms\t||\ttk/s: {tks:.2f}")
 
+if ddp:
+    destroy_process_group()
 
 import sys
 sys.exit(0)
