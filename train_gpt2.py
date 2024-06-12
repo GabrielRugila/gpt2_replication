@@ -230,28 +230,55 @@ train_loader = DataLoaderLite(8, 1024)
 
 torch.set_float32_matmul_precision('high')
 
-model = GPT(Config())
-model.eval()
+model = GPT(Config(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+    
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
 import time
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+for step in range(max_steps):
     t0 = time.time()
+
     x, y =  train_loader.next_batch()
     x, y = x.to(device), y.to(device)
+
     optimizer.zero_grad()
+
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
+
     loss.backward()
+
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step()
+
     torch.cuda.synchronize()
+
     t1 = time.time()
-    dt = (t1 - t0) * 1000
-    tks = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"Step {i}, Loss: {loss.item()}, Time: {dt:.2f}ms, tk/s: {tks:.2f}")
+    dt = t1 - t0
+    tks = (train_loader.B * train_loader.T) / dt
+    print(f"Step {step:4d}\t||\tLoss: {loss.item():.6f}\t||\tLR: {lr:.2e}\t||\tNorm: {norm:.4f}\t||\tTime: {dt*1000:.2f}ms\t||\ttk/s: {tks:.2f}")
 
 
 import sys
