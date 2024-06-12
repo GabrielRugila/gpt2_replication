@@ -249,7 +249,16 @@ torch.manual_seed(1337)
 if torch.cuda.is_available(): 
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(8, 1024)
+total_batch_size = 524288 # 2**19, ~0.5M (in number of tokens)
+B = 8
+T = 1024
+assert total_batch_size % (B * T) == 0, "Total batch size must be divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"Total desired batch size: {total_batch_size}")
+print(f"Calculated gradient accumulation steps: {grad_accum_steps}")
+
+
+train_loader = DataLoaderLite(B=B, T=T)
 
 torch.set_float32_matmul_precision('high')
 
@@ -278,16 +287,22 @@ import time
 
 for step in range(max_steps):
     t0 = time.time()
-
-    x, y =  train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-
     optimizer.zero_grad()
+    loss_accum = 0.0
+    for mirco_step in range(grad_accum_steps):
+        x, y =  train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
 
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
 
-    loss.backward()
+        #* Loss needs to be scaled to account for the gradient accumulation introduced here,
+        #* since the gradients add on at each successive backward().
+        #* The addition of gradients is a SUM, but we need a MEAN, 
+        #* so we scale the loss by the accumulation amount.
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -301,8 +316,8 @@ for step in range(max_steps):
 
     t1 = time.time()
     dt = t1 - t0
-    tks = (train_loader.B * train_loader.T) / dt
-    print(f"Step {step:4d}\t||\tLoss: {loss.item():.6f}\t||\tLR: {lr:.2e}\t||\tNorm: {norm:.4f}\t||\tTime: {dt*1000:.2f}ms\t||\ttk/s: {tks:.2f}")
+    tks = (train_loader.B * train_loader.T * grad_accum_steps) / dt
+    print(f"Step {step:4d}\t||\tLoss: {loss_accum.item():.6f}\t||\tLR: {lr:.2e}\t||\tNorm: {norm:.4f}\t||\tTime: {dt*1000:.2f}ms\t||\ttk/s: {tks:.2f}")
 
 
 import sys
