@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from dataclasses import dataclass
+from typing import List, Tuple, Union, Optional
 from hellaswag import render_example, iterate_examples
 
 @dataclass
@@ -106,7 +107,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx:torch.Tensor, targets:torch.Tensor=None) -> tuple[torch.Tensor, torch.Tensor|None]:
+    def forward(self, idx:torch.Tensor, targets: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # idx shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Unable to forward sequence of length {T}, block size is {self.config.block_size}"
@@ -209,7 +210,7 @@ def get_device():
 import tiktoken
 import numpy as np
 
-def load_tokens(filename):
+def load_tokens(filename) -> torch.Tensor:
     npt = np.load(filename)
     npt = npt.astype(np.int32)
     ptt = torch.tensor(npt, dtype=torch.long)
@@ -240,7 +241,7 @@ class DataLoaderLite:
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_pos = self.B * self.T * self.rank
 
-    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def next_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T = self.B, self.T
         buffer = self.tokens[self.current_pos : self.current_pos + B * T + 1]
         x = (buffer[:-1]).view(B, T)
